@@ -32,7 +32,11 @@ type MyConn struct {
 	PongHandle  Handler  // pong消息的处理函数
 	PingHandle  Handler  // ping消息的处理函数
 	SubProtocol string   // 子协议
-
+	UseMask     bool     // 是否使用掩码
+	fin         byte
+	rsv1        byte
+	rsv2        byte
+	rsv3        byte
 }
 
 type Upgrader struct {
@@ -170,12 +174,12 @@ func (c *MyConn) ReadMsg() (m Msg, err error) {
 	// 根据第一个字节的内容读取后续的数据
 	// FIN是否提示为最终消息
 	// RSV1~3的协议拓展判断
-	fin := firstByte[0]>>7 == 1    // 判断 FIN 字段是否为 1
-	rsv1 := firstByte[0]>>6&1 == 1 // 判断 RSV1 字段是否为 1
-	rsv2 := firstByte[0]>>5&1 == 1 // 判断 RSV2 字段是否为 1
-	rsv3 := firstByte[0]>>4&1 == 1 // 判断 RSV3 字段是否为 1
+	c.fin = firstByte[0] >> 7      // 判断 FIN 字段是否为 1
+	c.rsv1 = firstByte[0] >> 6 & 1 // 判断 RSV1 字段是否为 1
+	c.rsv2 = firstByte[0] >> 5 & 1 // 判断 RSV2 字段是否为 1
+	c.rsv3 = firstByte[0] >> 4 & 1 // 判断 RSV3 字段是否为 1
 	opcode := firstByte[0] & 0x0F  // 获取 Opcode 字段
-	fmt.Println(fin, rsv1, rsv2, rsv3)
+	fmt.Println(c)
 	// 读取第二个字节
 	secondByte := make([]byte, 1)
 	_, err = c.conn.Read(secondByte)
@@ -251,7 +255,7 @@ func (c *MyConn) ReadMsg() (m Msg, err error) {
 		m.Type = 8
 
 	default:
-		err = fmt.Errorf("未知的操作码%d", opcode)
+		err = fmt.Errorf("未知的操作码:%d", opcode)
 		return
 	}
 
@@ -261,17 +265,63 @@ func (c *MyConn) ReadMsg() (m Msg, err error) {
 func (c *MyConn) WriteMsg(m Msg) (err error) {
 	// 按照数据帧写出数据
 	// 消息内容
+	payload := m.Content
 
 	// payloadLen怎么处理？
-	// 啥时候应该消息分片？
+	payloadLen := len(payload)
 
-	// 写出发送的数据
-	_, err = c.conn.Write(data)
-	if err != nil {
-		// 写不进去，好寄
+	// 啥时候应该消息分片？
+	// 消息长度超过了WriteLimit，则需要将消息分片并分
+	useMask := c.UseMask
+	maxPayloadLen := c.WriteLimit
+
+	if payloadLen <= maxPayloadLen {
+		// 不需要分片
+		err = WriteDataFrame(c.conn, payload, payloadLen, useMask, m.Type)
+		if err != nil {
+			fmt.Println(err)
+			// 写不进去，好寄
+			return err
+		}
+		return
 	}
-	return
+
+	// 需要分片
+	for i := 0; i < payloadLen; i += maxPayloadLen {
+		end := i + maxPayloadLen
+		if end > payloadLen {
+			end = payloadLen
+		}
+		// fin变量就是用来确定消息是否已经全部写入到连接中
+		c.fin = byte(0)
+		if end == payloadLen {
+			c.fin = byte(1)
+		}
+
+		err = WriteDataFrame(c.conn, payload[i:end], end-i, useMask, m.Type)
+		if err != nil {
+			// 写不进去，好寄
+			fmt.Println(err)
+			return
+		}
+	}
+
+	return nil
 }
+
 func (c *MyConn) Close() {
-	// 应该怎么关闭？
+
+	// 发送CloseFrame
+	err := WriteCloseDataFrame(c.conn, c.UseMask)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+
+	// 关闭连接
+	err = c.conn.Close()
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
 }
